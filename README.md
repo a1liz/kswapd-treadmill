@@ -26,7 +26,7 @@ bursts. See `docs/MECHANISM.md` for the source-level chain.
 
 ## What it runs
 
-two arms, ~12 minutes on a spinning disk:
+two arms, ~6 minutes on the reference box:
 
 | arm | what happens | what it shows |
 |-----|--------------|---------------|
@@ -109,6 +109,11 @@ Two notes on reading the numbers:
   pulled into cache. We hit that - a fresh arm showed an 87% "hit burst"
   in its first second that was pure test-harness determinism, not cache
   healing.
+- A phase mark lands inside one sampling interval, so that row's delta
+  spans two phases. `analyze.py` attributes it by the sampler's own phase
+  label and drops the first row of a measure arm, where a single row can
+  carry 100k+ pages of the fill's last second and make kswapd look busy
+  after it has stopped.
 
 The signature to look for, all in one run:
 
@@ -136,33 +141,37 @@ python3 scripts/analyze.py docs/reference-run --secs 60
 
 ```
 arm          ops/s    hit%  hit1st10  hitLst10   slow%   max_us |  freeMB    o5    o6    o7    o8    o9   o10  pgscanK/s  stealF/s  reflt/s  kswapdCPU%    filepgMB
-A          3036306  100.00    100.00    100.00  0.0000     1257 |   50292  7183  5813  4686    19     1 10302          0         0        0        0.0  13894>13878
-C              457   17.52     16.49     17.82 82.0765   104150 |   15172 30994 28798    39     0     0     0         44         0      380        0.0   3886>3977
-C2             465   18.78     18.46     19.49 80.6961   117952 |   15047 30980 28798    39     0     0     0          0         0      386        0.0   3980>4067
+A          3062772  100.00    100.00    100.00  0.0000     1183 |   50253 12309 11295  9397    53  2615  7618          0         0        0        0.0  13894>13895
+C              459   16.81     17.55     17.34 82.6789   118319 |   15140 30261 27744   395     0     0     0          0         0      411        0.0   3857>3948
+C2             461   19.02     18.35     18.99 80.3813   127567 |   15010 30262 27744   395     0     0     0          0         0      376        0.0   3953>4037
 
 phase       secs  freeMB    o5    o6    o7    o8    o9   o10  pgscanK/s  stealF/s  reflt/s  kswapdCPU%    filepgMB
-A_warm        50   57049  7794  6378  5170     1     0 10424          0         0        0        0.0   1627>13068
-C_warm        50   15293 30971 28796    20     0     0     0      51135     51203        0        1.6   1780>3885
+A_warm        51   57013 13649 12618 10346     1  2958  6712          0         0        0        0.0   1627>13175
+C_warm        51   15292 29904 27469   395     0     0     0      48198     48417        1        1.6   1678>3853
 ```
 
 Four things to read out of that:
 
-1. `C_warm` scanned and stole **51k file pages per second for 50 seconds**
+1. `C_warm` scanned and stole **48k file pages per second for 51 seconds**
    while 15.3GB sat free, and the 12GB warm-up ended with only 3.9GB in
    the cache. `A_warm` - same read, same disk, no fragmentation - reached
-   13.1GB with kswapd at literally zero.
+   13.2GB with kswapd at literally zero.
 2. The `o8 = o9 = o10 = 0` columns are the precondition, measured rather
    than assumed: in the fragmented arm the machine has 15.3GB free and
-   **nothing above 256KB** in a single block (o5/o6 hold it all), while
+   **nothing above 256KB in a single block** (o5/o6 hold all 15GB), while
    the control arm has thousands of order-7/8/9/10 blocks. 1MB folios
    cannot be allocated in the first case and always can in the second.
-3. In both measure windows `filepgMB` is flat (`3886>3977`,
-   `3980>4067`) - no cache is being taken *while* the victim runs. The
-   damage was done during the fill. And kswapd drops from 51,135 pages/s
-   during the fill to 44/s during the measurement: the pump is the
+3. In both measure windows `filepgMB` is flat (`3857>3948`,
+   `3953>4037`) - no cache is being taken *while* the victim runs. The
+   damage was done during the fill. And kswapd goes from 48,198 pages/s
+   during the fill to 0 during the measurement: the pump is the
    sequential read.
-4. `C2` measures an unchanged cache 60 seconds later: 18.8% hit, 465
+4. `C2` measures an unchanged cache 60 seconds later: 19.0% hit, 461
    ops/s. It does not heal.
+
+A second, independent run of the same repo (commit before the analysis
+fixes, 15:04) reproduced every number within noise: A 3,036,306 ops/s /
+C 457 ops/s at 17.5% / C_warm 51,135 stolen pages per second.
 
 ## What this is not
 

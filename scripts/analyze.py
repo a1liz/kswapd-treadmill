@@ -86,6 +86,13 @@ def rows_for(name, w, clamp=None):
         rows = [r for r in samp if t0 <= r["epoch"] < t1]
     if clamp:
         clamped = [r for r in rows if r["epoch"] < w[0] + clamp]
+        # Drop the first row: its delta still spans the mark (the phase
+        # label changes at the mark, the counters do not), so it carries
+        # the previous phase's last second - in the reference runs one
+        # such row held between 2.5k and 107k pages of the fill and made
+        # the measure arm look like kswapd was still working.
+        if len(clamped) > 2:
+            clamped = clamped[1:]
         rows = clamped or rows
     return rows
 

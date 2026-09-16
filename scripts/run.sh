@@ -72,7 +72,13 @@ echo "file set  : ${TOTAL_GB}GB in $DATA_DIR, victim ${THREADS} threads on ${MEA
 
 # read the queue knobs from sysfs: opening the block device itself needs root
 dev=$(df --output=source "$DATA_DIR" | tail -1)
-base=$(basename "$(readlink -f "/sys/class/block/$(basename "$dev")" 2>/dev/null)" 2>/dev/null)
+base=""
+mm=$(stat -c '%t:%T' "$DATA_DIR" 2>/dev/null || echo "")
+if [ -n "$mm" ]; then		# hex major:minor -> the sysfs block name (dm-0, sda1, ...)
+	maj=$((16#${mm%%:*})); min=$((16#${mm##*:}))
+	base=$(basename "$(readlink -f "/sys/dev/block/$maj:$min" 2>/dev/null)" 2>/dev/null)
+fi
+[ -n "$base" ] || base=$(basename "$dev")
 rak=$(cat "/sys/block/$base/queue/read_ahead_kb" 2>/dev/null || echo "")
 if [ -n "$rak" ]; then
 	echo "read_ahead: ${rak}KB on $dev (max_sectors_kb=$(cat "/sys/block/$base/queue/max_sectors_kb" 2>/dev/null), rotational=$(cat "/sys/block/$base/queue/rotational" 2>/dev/null))"
