@@ -1,0 +1,17 @@
+# Let the runner launch frag_pin without a password.
+#
+#   sudo install -m 0440 sudoers.example /etc/sudoers.d/kswapd-treadmill
+#
+# Replace "USER" and the path.  sudo matches the exact absolute path, so
+# adjust it if you moved the repo.  (frag_ctl.sh only writes one sysfs
+# file, launches this repo's frag_pin, or kills it - it cannot be used to
+# run arbitrary commands.)
+#
+# Alternative, no sudo at all: give the binary the capability and run the
+# runner as your own user:
+#   sudo setcap cap_ipc_lock+ep /path/to/kswapd-treadmill/frag_pin
+# (then run.sh's `sudo -n frag_ctl.sh status` check will still fail - set
+#  SUDO= to skip it, and set the THP knob by hand if hugepages-2048kB is
+#  "never" on your box.)
+
+USER ALL=(root) NOPASSWD: /path/to/kswapd-treadmill/scripts/frag_ctl.sh
