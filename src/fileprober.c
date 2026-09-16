@@ -141,9 +141,19 @@ static void do_warm(void)
 static void *worker(void *arg)
 {
 	int tid = (int)(long)arg;
-	unsigned long long rng = 0x9e3779b97f4a7c15ull * (tid + 1);
+	/* Seed per process: with a fixed seed every measure arm replays the
+	 * exact same page sequence, so the first second of a window re-reads
+	 * what the previous window just pulled into cache - it looks like a
+	 * hit burst (or worse, like the cache healing) when it is only the
+	 * toy workload's determinism. */
+	unsigned long long rng = ((unsigned long long)time(NULL) << 32) ^
+				 ((unsigned long long)getpid() << 12) ^
+				 (unsigned long long)now_us() ^
+				 0x9e3779b97f4a7c15ull * (tid + 1);
 	char buf[4096];
 	char *p = buf;
+
+	rng |= 1;	/* xorshift64 must not be seeded with 0 */
 
 	while (!g_stop) {
 		int f = (int)((rng >> 33) % g_nfiles);

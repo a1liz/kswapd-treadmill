@@ -33,7 +33,7 @@ while :; do
 	ts=$(date +%s)
 	phase=$(cat "$PHASE" 2>/dev/null || echo NA)
 	free0=$(( $(nv nr_free_pages) * 4 / 1024 ))
-	read o5 o6 o7 o8 o9 o10 <<<"$(awk -v n="Node $NODE," '$1==n && $4=="Normal" {print $10, $11, $12, $13, $14, $15}' /proc/buddyinfo)"
+	read o5 o6 o7 o8 o9 o10 <<<"$(awk -v n="$NODE," '$1=="Node" && $2==n && $4=="Normal" {print $10, $11, $12, $13, $14, $15}' /proc/buddyinfo)"
 	scan=$(nv pgscan_kswapd); sk=$(nv pgsteal_kswapd); steal=$(nv pgsteal_file)
 	ref=$(nv workingset_refault_file); cs=$(gv compact_stall)
 	sd=$(nv pgsteal_direct); scd=$(nv pgscan_direct)

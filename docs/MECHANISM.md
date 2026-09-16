@@ -51,6 +51,19 @@ On the reference box (`max_sectors_kb=1024`, `read_ahead_kb=512`):
 sequential read asks for order-8 (1MB) folios**. That is the number
 that has to exist as a free contiguous block for the read to be quiet.
 
+The sampler's `o5..o10` columns measure exactly that precondition, and in
+the reference run they separate the two arms cleanly:
+
+```
+freeMB    o5    o6    o7    o8    o9   o10
+A_warm   57049  7794  6378  5170     1     0 10424     <- kswapd idle (0 pages/s)
+C_warm   15293 30971 28796    20     0     0     0     <- kswapd at 51k pages/s
+```
+
+15.3GB free and nothing above 256KB in one piece: every 1MB readahead
+request must fail. There is no need to guess whether the box is "really"
+fragmented - you can read it off the table.
+
 Note that the order is reduced only for window/EOF alignment, never on
 allocation failure:
 
@@ -176,12 +189,33 @@ victim is enough on its own.
 - Only the fill phase is instrumented per buddy order (`o5..o10` in the
   sampler). The measure phase's allocation orders are inferred from the
   source, not sampled.
-- The first ~10-20s of a measure window can show a *higher* hit rate
-  than the steady state allows. We could not fully explain that artifact
-  (it is not cache theft: `filepgMB` is flat across the same window),
-  and it does not change any conclusion.
 - The one experiment that would isolate the pump completely - warming
   with `POSIX_FADV_RANDOM` so that only order-0 allocations are made -
   is impractical on a slow disk: 12GB as single-page reads at ~380 IOPS
   is over two hours. The `A` vs `C` contrast (same workload, same disk,
   fragmentation the only difference) is what stands in for it.
+
+## 9. Two artifacts this rig had to shake out
+
+Both cost real time in developing this repro, so they are recorded here.
+
+**The early-window hit burst.** A measure window could start at a hit
+rate far above what the cache can support (87% in the first second of
+the `C2` arm of the reference run, against a steady 18%), then drop to
+normal in the next second. It looked like the cache "healing". It was
+neither healing nor a measurement artifact of the buckets: the victim's
+random offsets were seeded with a *constant*, so every measure arm
+replayed the identical page sequence. The prefix of a window re-read
+exactly the pages the previous window had just pulled into cache, and
+they were still cached. Arithmetic from the run: `C` did ~27,600 reads
+in its 60 seconds; `C2`'s first second did 28,200 reads, of which 27,591
+were <20us. Fixed by seeding the generator per process
+(`src/fileprober.c`).
+
+**Refaults that are not reclaim.** `workingset_refault_file` counts a
+read of any page that was in the cache earlier and got evicted - by
+anything, at any time. Reading a file set that was evicted an hour ago
+therefore shows refaults against zero kswapd activity. Inside a measure
+window the column is useful (in the reference run: 380/s against 457
+ops/s at 17% hit - i.e. exactly the victim's misses), but do not read it
+as evidence of reclaim during a fill.

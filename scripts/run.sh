@@ -62,20 +62,25 @@ fi
 echo "== preflight =="
 echo "results   : $R"
 echo "box       : $(nproc) CPUs, MemTotal $(( $(awk '/MemTotal/{print $2}' /proc/meminfo) / 1024 ))MB"
-echo "node$NODE    : $(( $(awk -v n="Node $NODE" '$1==n && $3=="MemTotal:"{print $4}' /sys/devices/system/node/node$NODE/meminfo 2>/dev/null || echo 0) / 1024 ))MB"
+nodemb=$(awk -v n="$NODE" '$1=="Node" && $2==n && $3=="MemTotal:"{print int($4/1024)}' \
+	/sys/devices/system/node/node$NODE/meminfo 2>/dev/null)
+[ -n "$nodemb" ] && echo "node$NODE     : ${nodemb}MB"
 echo "file set  : ${TOTAL_GB}GB in $DATA_DIR, victim ${THREADS} threads on ${MEAS_CPUS:-any CPUs}"
 
 [ -x "$REPO/frag_pin" ] || fail "no ./frag_pin - run make first"
 [ -x "$REPO/fileprober" ] || fail "no ./fileprober - run make first"
 
+# read the queue knobs from sysfs: opening the block device itself needs root
 dev=$(df --output=source "$DATA_DIR" | tail -1)
-ra=$(blockdev --getra "$dev" 2>/dev/null || echo "")
-if [ -n "$ra" ]; then
-	rak=$((ra / 2))
-	echo "read_ahead: ${rak}KB on $dev"
+base=$(basename "$(readlink -f "/sys/class/block/$(basename "$dev")" 2>/dev/null)" 2>/dev/null)
+rak=$(cat "/sys/block/$base/queue/read_ahead_kb" 2>/dev/null || echo "")
+if [ -n "$rak" ]; then
+	echo "read_ahead: ${rak}KB on $dev (max_sectors_kb=$(cat "/sys/block/$base/queue/max_sectors_kb" 2>/dev/null), rotational=$(cat "/sys/block/$base/queue/rotational" 2>/dev/null))"
 	[ "$rak" -eq 0 ] && fail "readahead is off on $dev - then no large folio is ever requested, nothing fails, kswapd never wakes. This repro cannot work by construction."
-	rot=$(cat "/sys/block/$(basename "$(readlink -f /sys/class/block/"$(basename "$dev")")")/queue/rotational" 2>/dev/null || echo "?")
-	[ "$rot" = "0" ] && echo "note: $dev is non-rotational: the effect is real but much smaller, and the cache heals fast"
+	[ "$(cat "/sys/block/$base/queue/rotational" 2>/dev/null)" = "0" ] && \
+		echo "note: $dev is non-rotational: the effect is real but much smaller, and the cache heals fast"
+else
+	echo "read_ahead: unknown for $dev (no /sys/block/$base/queue/read_ahead_kb)"
 fi
 
 memtotal=$(( $(awk '/MemTotal/{print $2}' /proc/meminfo) / 1024 ))
@@ -128,6 +133,7 @@ echo "A done"
 
 echo
 echo "--- building the arena (this is the slow part: it walks all free memory) ---"
+mark pinup
 ./fileprober --mode drop $ARGS 2>> "$R/warm.log"
 $SUDO "$FRAG_CTL" pin down >/dev/null 2>&1
 : > "$PIN_LOG" 2>/dev/null || true

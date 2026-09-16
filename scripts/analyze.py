@@ -66,8 +66,33 @@ def arm_stats(name, t0, t1):
                 max_us=max(r[3] for r in rows))
 
 
-def samp_stats(t0, t1):
-    rows = [r for r in samp if t0 <= r["epoch"] < t1]
+def rows_for(name, w, clamp=None):
+    """Rows belonging to a phase.
+
+    Select by the sampler's own phase label rather than a bare epoch range:
+    the boundary row carries the *whole* last second of the previous phase
+    (in the reference run one row holding 227k pages of the fill landed
+    inside the measure window that way), and the label is the honest
+    attribution of that delta.
+
+    A measure arm additionally has to be clamped to its duration, because
+    the label only changes at the *next* mark - the rows covering the
+    cache drop that follows the measurement are still labelled with the
+    arm's name, and they would read as the cache evaporating.
+    """
+    rows = [r for r in samp if r.get("phase") == name]
+    if not rows and w:
+        t0, t1 = w
+        rows = [r for r in samp if t0 <= r["epoch"] < t1]
+    if clamp:
+        clamped = [r for r in rows if r["epoch"] < w[0] + clamp]
+        rows = clamped or rows
+    return rows
+
+
+def samp_stats(t0, t1, name=None, clamp=None):
+    rows = rows_for(name, (t0, t1), clamp) if name else \
+        [r for r in samp if t0 <= r["epoch"] < t1]
     if not rows:
         return {}
     secs = max(1, rows[-1]["epoch"] - rows[0]["epoch"] + 1)
@@ -120,7 +145,7 @@ print(f"{'arm':8s} {'ops/s':>9s} {'hit%':>7s} {'hit1st10':>9s} {'hitLst10':>9s} 
       f"{'pgscanK/s':>10s} {'stealF/s':>9s} {'reflt/s':>8s} {'cstall':>6s} "
       f"{'kswapdCPU%':>10s} {'filepgMB':>14s}")
 for name, t0, t1 in measure:
-    a, s = arm_stats(name, t0, t1), samp_stats(t0, t1)
+    a, s = arm_stats(name, t0, t1), samp_stats(t0, t1, name, SECS)
     if not a:
         continue
     print(f"{name:8s} {a['ops']:9d} {a['hit']:7.2f} {a['h10']:9.2f} {a['hl10']:9.2f} "
@@ -134,7 +159,7 @@ print(f"{'phase':10s} {'secs':>5s} {'freeMB':>7s} {OCOLS_HDR} "
       f"{'pgscanK/s':>10s} {'stealF/s':>9s} {'reflt/s':>8s} {'cstall':>6s} "
       f"{'kswapdCPU%':>10s} {'filepgMB':>14s}")
 for name, t0, t1 in warm:
-    s = samp_stats(t0, t1)
+    s = samp_stats(t0, t1, name)
     if not s:
         continue
     print(f"{name:10s} {s['secs']:5d} {s['free']:7.0f} {OCOLS_ROW(s)} "
@@ -143,7 +168,7 @@ for name, t0, t1 in warm:
 
 print("\n== verdicts ==")
 for name, t0, t1 in warm:
-    s = samp_stats(t0, t1)
+    s = samp_stats(t0, t1, name)
     if not s:
         continue
     if s["scan"] > 0:
@@ -152,7 +177,7 @@ for name, t0, t1 in warm:
     else:
         print(f"[quiet] {name}: kswapd idle (0 pages scanned/s); page cache {s['fp0']}->{s['fp1']}MB")
 for name, t0, t1 in measure:
-    s = samp_stats(t0, t1)
+    s = samp_stats(t0, t1, name, SECS)
     a = arm_stats(name, t0, t1)
     if not s or not a:
         continue

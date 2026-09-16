@@ -94,6 +94,22 @@ a set of verdicts. The columns that matter:
 | `kswapdCPU%` | kswapd's CPU time in the window |
 | `filepgMB` | absolute page-cache size, first -> last row of the window |
 
+Two notes on reading the numbers:
+
+- `reflt/s` inside a measure window lands on the victim's miss rate (in
+  the reference run: 380/s against 457 ops/s at 17% hit). Those are the
+  pages the fill-time reclaim threw away and the victim is asking for
+  again. During a *fill* the column is mostly noise: reading a file that
+  was evicted earlier counts as a refault even when kswapd never ran, so
+  a fill can show tens of thousands of refaults against zero kswapd
+  activity if the set was read on this machine before.
+- The victim picks random offsets with a seed mixed per process. It has
+  to: with a fixed seed every arm replays the identical page sequence and
+  the first second of a window re-reads exactly what the previous window
+  pulled into cache. We hit that - a fresh arm showed an 87% "hit burst"
+  in its first second that was pure test-harness determinism, not cache
+  healing.
+
 The signature to look for, all in one run:
 
 1. **A**: `pgscanK/s = 0`, hit rate 100%, millions of ops/s.
@@ -111,21 +127,42 @@ The signature to look for, all in one run:
 
 94GB box, 2 NUMA nodes, LVM on two spinning disks (~380 random-4KB IOPS),
 `read_ahead_kb=512`, `max_sectors_kb=1024` (=> readahead asks for folios
-up to order 8 = 1MB):
+up to order 8 = 1MB).  The raw data is in `docs/reference-run/`; you can
+re-analyze it without running anything:
 
 ```
-arm          ops/s    hit%   ...  freeMB  pgscanK/s  stealF/s  kswapdCPU%    filepgMB
-A          2853463  100.00   ...   50462          0         0        0.0   13720>13721
-C              459   16.74   ...   15220       4757      4757        0.1    3702>3793
-
-phase       secs  freeMB       pgscanK/s  stealF/s  kswapdCPU%    filepgMB
-A_warm        --   50456               0         0        0.0   13720>13720
-C_warm        49   15350           46390     46471        1.6    1451>3704
+python3 scripts/analyze.py docs/reference-run --secs 60
 ```
 
-Read that last line again: the warm-up read 12GB and ended with 3.7GB in
-the cache, 15.3GB still reported free, and kswapd having reclaimed 46k
-file pages per second for 49 seconds to do it.
+```
+arm          ops/s    hit%  hit1st10  hitLst10   slow%   max_us |  freeMB    o5    o6    o7    o8    o9   o10  pgscanK/s  stealF/s  reflt/s  kswapdCPU%    filepgMB
+A          3036306  100.00    100.00    100.00  0.0000     1257 |   50292  7183  5813  4686    19     1 10302          0         0        0        0.0  13894>13878
+C              457   17.52     16.49     17.82 82.0765   104150 |   15172 30994 28798    39     0     0     0         44         0      380        0.0   3886>3977
+C2             465   18.78     18.46     19.49 80.6961   117952 |   15047 30980 28798    39     0     0     0          0         0      386        0.0   3980>4067
+
+phase       secs  freeMB    o5    o6    o7    o8    o9   o10  pgscanK/s  stealF/s  reflt/s  kswapdCPU%    filepgMB
+A_warm        50   57049  7794  6378  5170     1     0 10424          0         0        0        0.0   1627>13068
+C_warm        50   15293 30971 28796    20     0     0     0      51135     51203        0        1.6   1780>3885
+```
+
+Four things to read out of that:
+
+1. `C_warm` scanned and stole **51k file pages per second for 50 seconds**
+   while 15.3GB sat free, and the 12GB warm-up ended with only 3.9GB in
+   the cache. `A_warm` - same read, same disk, no fragmentation - reached
+   13.1GB with kswapd at literally zero.
+2. The `o8 = o9 = o10 = 0` columns are the precondition, measured rather
+   than assumed: in the fragmented arm the machine has 15.3GB free and
+   **nothing above 256KB** in a single block (o5/o6 hold it all), while
+   the control arm has thousands of order-7/8/9/10 blocks. 1MB folios
+   cannot be allocated in the first case and always can in the second.
+3. In both measure windows `filepgMB` is flat (`3886>3977`,
+   `3980>4067`) - no cache is being taken *while* the victim runs. The
+   damage was done during the fill. And kswapd drops from 51,135 pages/s
+   during the fill to 44/s during the measurement: the pump is the
+   sequential read.
+4. `C2` measures an unchanged cache 60 seconds later: 18.8% hit, 465
+   ops/s. It does not heal.
 
 ## What this is not
 
