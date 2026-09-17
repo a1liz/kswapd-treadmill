@@ -15,6 +15,10 @@
 #   kswapd0_jiffies       kswapd CPU time (delta / CLK_TCK = CPU seconds)
 #   oom_kill / pswpout    must stay flat: no memory pressure, no swap
 set -u
+# Ignore TERM/INT/HUP: the sampler kept getting killed at window boundaries
+# by a stray signal from the orchestrator's `timeout` windows, silently losing
+# the kernel side of whole runs.  Cleanup must use SIGKILL (kill -KILL).
+trap '' TERM INT HUP
 OUT=$1
 PHASE=$2
 NODE=${3:-0}
@@ -38,6 +42,9 @@ while :; do
 	ref=$(nv workingset_refault_file); cs=$(gv compact_stall)
 	sd=$(nv pgsteal_direct); scd=$(nv pgscan_direct)
 	so=$(gv pswpout); oom=$(gv oom_kill)
+	for v in scan sk steal ref cs sd scd so oom; do
+		eval "[ -n \"\$$v\" ] || $v=0"
+	done
 	famb=$(( $(gv nr_file_pages) * 4 / 1024 ))
 	pid=$(pgrep -x "kswapd$NODE" | head -1)
 	jif=0

@@ -109,7 +109,7 @@ $SUDO "$FRAG_CTL" status >/dev/null 2>&1 || fail "cannot run '$SUDO $FRAG_CTL' -
 
 SAMP=""
 cleanup() {
-	[ -n "$SAMP" ] && kill "$SAMP" 2>/dev/null
+	[ -n "$SAMP" ] && kill -KILL "$SAMP" 2>/dev/null	# sampler ignores TERM
 	$SUDO "$FRAG_CTL" pin down >/dev/null 2>&1
 	[ "$H2_SAVED" = "never" ] && $SUDO "$FRAG_CTL" thp2048 "$H2_SAVED" >/dev/null 2>&1
 	pkill -TERM -f "$REPO/frag_pin" 2>/dev/null
