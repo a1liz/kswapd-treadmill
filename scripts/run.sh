@@ -142,15 +142,20 @@ echo "--- building the arena (this is the slow part: it walks all free memory) -
 mark pinup
 ./fileprober --mode drop $ARGS 2>> "$R/warm.log"
 $SUDO "$FRAG_CTL" pin down >/dev/null 2>&1
-: > "$PIN_LOG" 2>/dev/null || true
+# Only accept lines appended after this point.  The log is appended to by
+# root, so our truncation above can silently fail - and a stale FRAG_READY
+# from a previous run then looks like a finished arena while frag_pin is
+# still walking memory (the whole run measures the wrong state).
+before=$(wc -l < "$PIN_LOG" 2>/dev/null || echo 0)
 $SUDO "$FRAG_CTL" pin up "$RESERVE_MB" "$PIN_KB" || fail "cannot launch frag_pin"
+ready=""
 for _ in $(seq 1 1800); do
-	grep -q FRAG_READY "$PIN_LOG" 2>/dev/null && break
-	grep -q FRAG_FAIL "$PIN_LOG" 2>/dev/null && fail "arena build failed, see $PIN_LOG"
+	ready=$(tail -n +$((before + 1)) "$PIN_LOG" 2>/dev/null | grep "^FRAG_READY" | tail -1)
+	[ -n "$ready" ] && break
+	tail -n +$((before + 1)) "$PIN_LOG" 2>/dev/null | grep -q "^FRAG_FAIL" && fail "arena build failed, see $PIN_LOG"
 	sleep 1
 done
-grep -q FRAG_READY "$PIN_LOG" 2>/dev/null || fail "arena build timed out (1800s), see $PIN_LOG"
-ready=$(grep FRAG_READY "$PIN_LOG" | tail -1)
+[ -n "$ready" ] || fail "arena build timed out (1800s), see $PIN_LOG"
 echo "$ready"
 o9=$(sed -n 's/.*o9=\([0-9]*\).*/\1/p' <<<"$ready")
 o10=$(sed -n 's/.*o10=\([0-9]*\).*/\1/p' <<<"$ready")
