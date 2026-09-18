@@ -143,12 +143,59 @@ tmux new-session -d -s pump    "$PWD/scripts/pump-test.sh"
 Needs `fio` (apt-get install fio), `tar`, root via `frag_ctl.sh`
 (`sudoers.example`), and a slow disk to make the effect visible.
 
+## Spreading: an unbound reader drags the healthy node in
+
+Scenario 2's null result ("unbound readers never pump") turns out to be a stay
+of execution, not immunity: the fallback deposits the reader's page cache on
+the healthy node, and once that node has no large free block either, the
+failure condition follows it there.
+
+`scripts/spread-test.sh` (run 2026-09-18; data in
+`docs/reference-run-real/spread/`, re-analyzable with
+`python3 scripts/report-spread.py docs/reference-run-real/spread 0 1`):
+
+- node 0 fragmented (14.6GB free, o8 = o9 = o10 = 0), node 1 healthy
+  (23.8GB free, 5826 order-10 blocks)
+- an unbound reader - CPU pinned to node 0, memory policy default, the common
+  real configuration - reads 29GB
+
+Per second on node 1 (node 0 the whole time: free never left 14.6GB, o8/o9/o10
+stayed 0, kswapd scanned 81 pages/s ~= nothing):
+
+```
++115s  free=1565MB  o8=23  o9=18  o10=289   pgscanK=0
++120s  free=663MB   o8=23  o9=18  o10=64    pgscanK=0
++125s  free=385MB   o8=1   o9=0   o10=3     pgscanK=35943   <- pump starts
++140s  free=433MB   o8=0   o9=0   o10=4     pgscanK=36717   cache stops growing
+```
+
+Three things scenario 2 could only infer, now measured:
+
+1. **The fallback is real.** Node 0 had 14.6GB free and the reader, pinned to
+   node 0's CPUs, got none of it: every large folio was refused by the
+   fragmented node and served from node 1.
+2. **The far node's blocks drain from the largest down** (o10 5826 -> 0,
+   o9 67 -> 0, o8 128 -> 0): each order-8 request splits the biggest block
+   available.
+3. **The trigger is the smallest available order, not the amount of free
+   memory.** kswapd was silent with 289 order-10 and 18 order-9 blocks left,
+   and jumped to 35,943 pages/s the second order-8 hit 1.  385MB of free
+   memory made no difference - the same "plenty free, still broken" shape as
+   the synthetic repro, approached from the other side.
+
+Complete condition: **no node in the allocation's zonelist may have a free
+block of the required order.**  Reached by (a) confining the allocation
+(MPOL_BIND, cgroup cpuset, numactl); (b) filling the other nodes until they
+lose their large blocks - which an unbound reader does to itself, as here; or
+(c) fragmenting them too.  A single-node machine satisfies it by construction.
+
 ## Open questions
 
 - Bound 4KB readers start pumping several seconds later than 1MB readers;
   the ramp is not understood in detail.
-- The cost of the fallback itself (pages and cache landing on the far node,
-  remote access latency) is not measured.
+- The fallback's cost is only partly measured: we know the cache lands on the
+  far node and the far node's large blocks are consumed by it.  The latency
+  penalty (remote access) is not measured.
 - The two-process experiment has not been run with *both* processes bound to
   the fragmented node - that is the configuration where a backup should be
   able to hurt a co-located service, and it is the obvious next run.

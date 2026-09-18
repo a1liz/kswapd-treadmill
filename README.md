@@ -202,8 +202,10 @@ C 457 ops/s at 17.5% / C_warm 51,135 stolen pages per second.
   reader's high-order allocations confined to the fragmented node;
   `docs/REAL-SCENARIO.md` has the measured bound-vs-unbound comparison
   (57k-88k pages/s vs 0), a two-process version of this rig (a real `tar`
-  backup against a real `fio` service), and eight ways to build a rig that
-  silently measures nothing.
+  backup against a real `fio` service), the measurement showing that an
+  unbound reader *eventually* drags the other node in as well (the failure
+  condition follows the cache it deposits there), and eight ways to build a
+  rig that silently measures nothing.
 
 ## Files
 
@@ -222,6 +224,8 @@ scripts/run-real.sh     tar backup + fio service, running together
 scripts/pump-test.sh    which readers pump? (one reader per window)
 scripts/report-real.py  fio + kswapd report for run-real.sh
 scripts/report-pump.py  kswapd report for pump-test.sh
+scripts/spread-test.sh  does fragmentation spread to the other node?
+scripts/report-spread.py per-node report for spread-test.sh
 docs/REAL-SCENARIO.md   the trigger condition, the results, and 8 traps
 ```
 
