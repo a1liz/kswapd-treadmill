@@ -1,5 +1,6 @@
 frag_pin
 fileprober
+bindread
 *.o
 data/
 results/

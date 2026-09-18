@@ -40,6 +40,15 @@ fragmented when the warm-up runs.
 ## Requirements
 
 - Linux with large-folio page-cache readahead (6.8+; developed on 7.2.3)
+- **On a multi-node box the reader must be confined to the fragmented node.**
+  `fileprober` and `frag_pin` already call `MPOL_BIND`, so this repro works
+  as shipped.  An *unbound* reader falls back to another node's free
+  blocks, the allocation never fails, and no pump happens at all - which is
+  why plenty of otherwise-identical setups reproduce nothing.  A machine
+  with a single node has no fallback and always behaves like a bound one.
+  Measured, with the same 1MB reader on the same fragmented node:
+  bound -> kswapd scans 57k-88k pages/s, unbound -> 0.  See
+  `docs/REAL-SCENARIO.md`.
 - RAM >= ~2.2x the file set size, on one NUMA node (the arena needs
   most of a node's free memory)
 - `read_ahead_kb > 0` on the file set's device (preflight checks this)
@@ -189,17 +198,31 @@ C 457 ops/s at 17.5% / C_warm 51,135 stolen pages per second.
   block of order 8" less cleanly - but the requirement is only that, and
   long uptimes with unmovable pages (mlock, hugepages, slab, driver
   buffers) get there.
+- Not the whole story about *when* it happens. The pump also needs the
+  reader's high-order allocations confined to the fragmented node;
+  `docs/REAL-SCENARIO.md` has the measured bound-vs-unbound comparison
+  (57k-88k pages/s vs 0), a two-process version of this rig (a real `tar`
+  backup against a real `fio` service), and eight ways to build a rig that
+  silently measures nothing.
 
 ## Files
 
 ```
 src/frag_pin.c        builds the fragmented-but-sufficient state
 src/fileprober.c      the victim: warm (sequential) + measure (random 4KB)
+src/bindread.c        sequential reader bound to one node, any block size
 scripts/run.sh        orchestrator: A -> arena -> C -> C2
 scripts/sampler.sh    1Hz vmstat/buddyinfo sampler
 scripts/analyze.py    tables + verdicts
 scripts/frag_ctl.sh   privileged helper (launch frag_pin, THP knob)
 docs/MECHANISM.md     why this happens, with kernel source references
+
+scenario 2 (two real processes, and what actually triggers the pump):
+scripts/run-real.sh     tar backup + fio service, running together
+scripts/pump-test.sh    which readers pump? (one reader per window)
+scripts/report-real.py  fio + kswapd report for run-real.sh
+scripts/report-pump.py  kswapd report for pump-test.sh
+docs/REAL-SCENARIO.md   the trigger condition, the results, and 8 traps
 ```
 
 Cleanup is automatic: the arena is stopped and the THP knob restored when

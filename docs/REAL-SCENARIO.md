@@ -1,0 +1,154 @@
+# Scenario 2: two real processes, and what actually triggers the treadmill
+
+The minimal repro (`scripts/run.sh`) uses one synthetic victim whose own
+warm-up is the pump.  This scenario asks the two questions that follow:
+
+1. does the same thing happen when the *pump* and the *victim* are two
+   separate real programs (a backup and a service), running at the same time?
+2. **under what conditions does the pump exist at all?**
+
+The answer to (2) turned out to be the most useful result here, and it is
+not "large sequential reads" - see "The trigger" below.
+
+## The trigger: the allocation must be confined to the fragmented node
+
+Same fragmented state (15GB free, o8 = o9 = o10 = 0), same 1MB sequential
+read, one variable - whether the reader's allocations are bound to that node:
+
+| reader | 1MB reads | NUMA policy | kswapd scanning |
+|---|---|---|---|
+| `./fileprober --mode warm` | yes | `MPOL_BIND` node 0 | **~50,000 - 88,000 pages/s** |
+| `./bindread --bs 1M` | yes | `MPOL_BIND` node 0 | **56,719 pages/s** |
+| `./bindread --bs 4k` | no (4KB) | `MPOL_BIND` node 0 | **31,638 pages/s** |
+| `dd bs=1M` | yes | none | **0** |
+| `fio --rw=read --bs=1M` | yes | none | 583 /s |
+| `fio --rw=read --bs=64k` | no | none | 0 |
+| `tar` (default 10KB blocks) | no | none | 360 /s |
+
+Mechanism: an unbound task that cannot satisfy a 1MB folio from the
+fragmented node simply **falls back to the other node's zonelist entry**,
+where the arena pinned nothing and order-9/10 blocks are plentiful.  The
+allocation succeeds, `__alloc_pages_slowpath()` is never entered, and
+`wake_all_kswapds()` is never called.  `MPOL_BIND` (or a machine with a
+single node, where there is nothing to fall back to) is what forces the
+failure.
+
+Two corollaries that cost experiments to learn:
+
+- **Read size is not the discriminator.**  A bound 4KB sequential reader
+  pumps too (31k pages/s); an unbound 1MB reader does not pump at all.
+- **This is why the effect is reported inconsistently in the wild.**
+  Multi-node machines without binding cannot reproduce it; single-node
+  machines (laptops, most cloud VMs) have no fallback and hit it.
+
+Source: `mm/readahead.c:288` allocates cold readahead at
+`mapping_min_folio_order` (= 0 for ordinary files); only the
+`page_cache_ra_order` path (`mm/readahead.c:481`, async readahead or a
+partially-cached sequential run) asks for large folios.  `mm/page_alloc.c:4814`
+wakes kswapd from the allocation slow path, and `mm/vmscan.c:7017` +
+`include/linux/compaction.h:67` bound each wake-up to 32 pages
+(`compact_gap`) - so the harm is the *wake-up rate*, not any single reclaim.
+
+## The two-process rig
+
+```
+pump    tar streaming a backup tree,  models `tar cf - /data | ssh backup`
+victim  fio randread 4KB x4 jobs over its own working set,
+        disjoint from the backup tree, models a cache-dependent service
+```
+
+Both are ordinary unbound processes - which, per the section above, means
+neither of them can pump on this box, and that is the point: the rig
+measures what actually happens in the common unbound configuration.
+
+Arms (the backup runs from before the service warms up; it is stopped for
+the last window to see whether the cache heals):
+
+| arm | window 1 | window 2 | window 3 |
+|---|---|---|---|
+| R1 no fragmentation | backup + warm-up | backup + fio | fio alone |
+| R2 fragmented (arena) | backup + warm-up | backup + fio | fio alone |
+
+## Results
+
+Reference run (`python3 scripts/report-real.py docs/reference-run-real/two-process --win 60`):
+
+```
+window                iops   clat_p50   clat_p99
+R1w1               2617214      1.1us      1.5us   control, backup running
+R1w2               2616752      1.1us      1.5us   control, backup stopped
+R2w1               2234475      1.4us      2.0us   fragmented, backup running
+R2w2               2254890      1.4us      1.9us   fragmented, backup stopped
+```
+
+The service is unharmed on the fragmented box, and kswapd stays silent -
+because nothing in the rig is bound to the fragmented node.  A 20GB backup
+reading through a fragmented node in the default (unbound) configuration
+simply does not walk into this bug.
+
+An earlier run on the same rig (with a broken pump - see gotchas) showed
+the victim collapsing to 777 iops / p50 11.2us / p99 35ms on the fragmented
+side.  That number is **not** attributable to the backup: the damage came
+from the victim's own warm-up through the fragmented node plus a device
+ordering bug, and the backup process was not reading anything at all.
+It is kept as a cautionary example, not as evidence.
+
+## Pump test
+
+`PUMP_READERS="fp tar dd bind1M" scripts/pump-test.sh` runs readers one per
+window on the same fragmented state, dropping the cache before each, and
+prints what kswapd did:
+
+```
+python3 scripts/report-pump.py docs/reference-run-real/pump
+window       secs  freeMB    o7   o8   o9   o10  pgscanK/s  stealF/s      filepgMB kswapdCPU%
+W_fp           37   14810   398    0    0     0      65161     65543 12076>10488       5.7
+W_dd_unbind    35   16312  1207    0    0     0          0         0  9480>17225        0.0
+W_br_1M        36   17160  1208    0    0     0      56719     57342   9269>9221        4.5
+W_br_4K        41   17652     0    0    0     0      31638     31706   7785>9277        2.4
+```
+
+`W_fp` (the synthetic victim's warm-up, bound) is the positive control and
+is kept in every run: its per-second waveform is `0 -> 7.7k -> 43k -> 78k
+-> 95k -> steady 90-110k pages/s` with the page cache *shrinking while it
+fills* (12076 -> 10488 MB above).  If that control is ever flat, the rig is
+broken and no conclusion should be drawn from the other windows.
+
+## Gotchas (all of them look normal)
+
+| # | trap | symptom | fix |
+|---|---|---|---|
+| 1 | fio defaults to `--invalidate=1` | victim reads from disk for the whole run (p50 8ms), looks like "the cache is gone" | pass `--invalidate=0` |
+| 2 | `tar ... > /dev/null` | **GNU tar treats /dev/null as the archive target and skips reading entirely** (0.057s, rc=0) - the backup silently becomes a no-op | `tar ... \| cat > /dev/null` |
+| 3 | dropping a large cache *after* building the arena | frees GBs as large blocks and **heals the fragmentation** (o8: 0 -> 12016) | drop before the arena |
+| 4 | accepting a stale `FRAG_READY` | the log is appended by root, so truncating it as the user can silently fail; a stale line makes the run start while `frag_pin` is still walking memory | only accept lines appended after launch (`tail -n +N`) |
+| 5 | `pkill -f "<pattern>"` | the pattern is in your own command line - it kills the shell running it (exit 144) | use `pkill -x` / `pgrep -x` |
+| 6 | sampler killed by a stray signal | it dies at a window boundary, silently losing the kernel side of the whole run | ignore TERM/INT/HUP, clean up with `kill -KILL` |
+| 7 | `atol("1M") == 1` | a reader silently does 1-byte reads and measures nothing | parse suffixes explicitly and echo the parsed value |
+| 8 | a freshly written backup tree | GBs of dirty pages saturate the disk and poison every timing after it (fio at 22 IOPS) | wait for `Dirty:` in `/proc/meminfo` to drain |
+
+Traps 1-3 each produced a full run of plausible-looking numbers that meant
+nothing.  This is why every run keeps a positive control and why the doc
+records which runs were invalidated and why.
+
+## Running it
+
+```sh
+make
+export DATA_DIR=/path/to/a/file/set      # victim set; scripts/run.sh can create one
+tmux new-session -d -s realscn "$PWD/scripts/run-real.sh"
+tmux new-session -d -s pump    "$PWD/scripts/pump-test.sh"
+```
+
+Needs `fio` (apt-get install fio), `tar`, root via `frag_ctl.sh`
+(`sudoers.example`), and a slow disk to make the effect visible.
+
+## Open questions
+
+- Bound 4KB readers start pumping several seconds later than 1MB readers;
+  the ramp is not understood in detail.
+- The cost of the fallback itself (pages and cache landing on the far node,
+  remote access latency) is not measured.
+- The two-process experiment has not been run with *both* processes bound to
+  the fragmented node - that is the configuration where a backup should be
+  able to hurt a co-located service, and it is the obvious next run.
