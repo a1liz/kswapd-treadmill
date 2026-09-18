@@ -2,8 +2,10 @@
 # run-real.sh - the real-scenario variant: two independent processes
 #
 #   pump     = tar streaming a backup tree,  models `tar cf - /data | ssh backup`
+#              (BOUND=1: ./bindread, i.e. the same read but MPOL_BIND to $NODE)
 #   victim   = fio randread 4KB x4 jobs over its own working set (disjoint from
 #              the backup tree), models a cache-dependent service
+#              (BOUND=1: fio --numa_mem_policy=bind:$NODE)
 #
 # Arms (the backup runs from before the service warms up, and is stopped for
 # the last window to see whether the cache heals):
@@ -11,10 +13,11 @@
 #   R2  fragmented (arena): same
 #
 # The headline is window 1 of each arm: same backup, same service, same disk,
-# only the fragmentation differs.  Read docs/REAL-SCENARIO.md first - the
-# result depends on whether the readers' allocations are confined to the
-# fragmented node, and on this rig they are NOT (no MPOL_BIND), which is
-# itself part of the finding.
+# only the fragmentation differs.  Read docs/REAL-SCENARIO.md first: the
+# result depends entirely on whether the readers' allocations are confined to
+# the fragmented node.  Default (unbound): the service is unharmed (p50
+# 1.4us).  BOUND=1: the service collapses to 224 iops / p50 16ms.  Both are
+# true; they are different configurations.
 #
 # Launch detached:  tmux new-session -d -s realscn "$PWD/scripts/run-real.sh"
 set -u
@@ -34,7 +37,17 @@ TASKSET=${TASKSET:-taskset -c 8-11}
 FRAG_CTL=${FRAG_CTL:-$REPO/scripts/frag_ctl.sh}
 PIN_LOG=${PIN_LOG:-$REPO/frag_pin.log}
 SUDO=${SUDO:-sudo -n}
+# BOUND=1 puts *both* processes under MPOL_BIND on $NODE.  Without it the
+# readers are unbound, the kernel falls back to another node's free blocks and
+# nothing pumps at all (see docs/REAL-SCENARIO.md) - which is the common
+# real-world configuration, but it measures a different question.
+BOUND=${BOUND:-0}
 [ "$(id -u)" -eq 0 ] && SUDO=""
+if [ "$BOUND" = "1" ]; then
+	NUMA_OPTS="--numa_cpu_nodes=$NODE --numa_mem_policy=bind:$NODE"
+else
+	NUMA_OPTS=""
+fi
 
 FILES=$((REAL_GB / FILE_GB))
 VFILES=""
@@ -54,6 +67,7 @@ H2_SAVED=$(sed -n 's/.*\[\(.*\)\].*/\1/p' /sys/kernel/mm/transparent_hugepage/hu
 cleanup() {
 	[ -n "${SAMP:-}" ] && kill -KILL "$SAMP" 2>/dev/null	# sampler ignores TERM
 	pkill -x tar 2>/dev/null
+	pkill -x bindread 2>/dev/null
 	$SUDO "$FRAG_CTL" pin down >/dev/null 2>&1
 	[ "$H2_SAVED" = "never" ] && $SUDO "$FRAG_CTL" thp2048 "$H2_SAVED" >/dev/null 2>&1
 }
@@ -81,22 +95,30 @@ wait_writeback() {
 }
 warm() {	# sequential read of the victim's working set
 	$TASKSET fio --name=warm --rw=read --bs=1M --numjobs=1 --filename="$VFILES" \
-		--ioengine=psync --direct=0 --invalidate=0 --group_reporting \
+		--ioengine=psync --direct=0 --invalidate=0 --group_reporting $NUMA_OPTS \
 		--output-format=json --output="$R/$1.warm.json" > /dev/null || fail "warm $1"
 }
 victim() {	# fio random reads for WIN seconds
 	$TASKSET fio --name=victim --rw=randread --bs=4k --numjobs=4 \
 		--filename="$VFILES" --ioengine=psync --direct=0 --invalidate=0 \
-		--time_based --runtime="$WIN" --group_reporting --randrepeat=0 \
+		--time_based --runtime="$WIN" --group_reporting --randrepeat=0 $NUMA_OPTS \
 		--output-format=json --output="$R/$1.fio.json" > /dev/null || fail "victim $1"
 }
-pump() {	# the backup: stream the tree to a consumer, until killed
-	# NOT `> /dev/null`: GNU tar sees /dev/null as the archive target and
-	# skips reading the data entirely (0.057s, rc=0) - the backup silently
-	# becomes a no-op.  Pipe it through cat instead.
-	while :; do
-		tar cf - -C "$BACKUP_DIR" . 2>/dev/null | cat > /dev/null
-	done
+pump() {	# the backup: stream the tree, until killed
+	if [ "$BOUND" = "1" ]; then
+		# bound big-block reads (bindread sets MPOL_BIND itself and exits
+		# if that fails, so if it is running the policy is in effect)
+		while :; do
+			./bindread --node "$NODE" --bs 1M "$BACKUP_DIR"/*.dat
+		done
+	else
+		# NOT `> /dev/null`: GNU tar sees /dev/null as the archive target
+		# and skips reading the data entirely (0.057s, rc=0) - the backup
+		# silently becomes a no-op.  Pipe it through cat instead.
+		while :; do
+			tar cf - -C "$BACKUP_DIR" . 2>/dev/null | cat > /dev/null
+		done
+	fi
 }
 arm() {		# arm R1|R2
 	local n=$1
@@ -104,15 +126,17 @@ arm() {		# arm R1|R2
 	pump & local p=$!
 	mark "${n}_warm"; warm "${n}w"    || { kill $p; return 1; }
 	mark "${n}_w1";   victim "${n}w1" || { kill $p; return 1; }
-	kill $p 2>/dev/null; pkill -x tar 2>/dev/null
+	kill $p 2>/dev/null; pkill -x tar 2>/dev/null; pkill -x bindread 2>/dev/null
 	mark "${n}_w2";   victim "${n}w2" || return 1
 	echo "$n done"
 }
 
 echo "== preflight =="
 echo "results : $R"
+echo "mode    : $([ "$BOUND" = 1 ] && echo "BOUND to node $NODE (both processes)" || echo "unbound (readers fall back to other nodes)")"
 [ -x ./frag_pin ] && [ -x ./fileprober ] || fail "run make first"
 command -v fio >/dev/null || fail "fio not installed (apt-get install fio)"
+[ "$BOUND" = "1" ] && { [ -x ./bindread ] || fail "BOUND=1 needs ./bindread (make)"; }
 [ -f "$DATA_DIR/file$(printf %02d $((FILES - 1))).dat" ] || fail "victim set missing in $DATA_DIR"
 $SUDO "$FRAG_CTL" status >/dev/null 2>&1 || fail "cannot run '$SUDO $FRAG_CTL'"
 [ "$(sed -n 's/.*\[\(.*\)\].*/\1/p' /sys/kernel/mm/transparent_hugepage/enabled)" = "never" ] && \

@@ -69,7 +69,7 @@ the last window to see whether the cache heals):
 | R1 no fragmentation | backup + warm-up | backup + fio | fio alone |
 | R2 fragmented (arena) | backup + warm-up | backup + fio | fio alone |
 
-## Results
+## Results, unbound (the default configuration)
 
 Reference run (`python3 scripts/report-real.py docs/reference-run-real/two-process --win 60`):
 
@@ -92,6 +92,51 @@ side.  That number is **not** attributable to the backup: the damage came
 from the victim's own warm-up through the fragmented node plus a device
 ordering bug, and the backup process was not reading anything at all.
 It is kept as a cautionary example, not as evidence.
+
+## Results, BOUND=1: the backup takes the service down
+
+`BOUND=1 scripts/run-real.sh` puts *both* processes under `MPOL_BIND` on the
+fragmented node (fio via `--numa_mem_policy=bind:0`, the backup via
+`./bindread`).  Everything else - arms, windows, disk, file sets - is
+identical to the run above.  `python3 scripts/report-real.py
+docs/reference-run-real/two-process-bound --win 60`:
+
+```
+window                iops   clat_p50   clat_p99
+R1w1               2517591      1.1us      1.7us   control, backup running
+R1w2               2532179      1.1us      1.7us   control, backup stopped
+R2w1                   224  16056.3us  58982.4us   fragmented, backup running
+R2w2                   390   7962.6us  40632.3us   fragmented, backup stopped
+```
+
+and on the kernel side, in the same run:
+
+| phase | kswapd scanning | file pages stolen | kswapd CPU |
+|---|---|---|---|
+| R1 (both windows) | 0 /s | 0 /s | 0.0% |
+| R2_warm (service warming, backup running) | 38,064 /s | 38,600 /s | 2.6% |
+| R2_w1 (service serving, backup running) | **20,909 /s** | 21,858 /s | 4.6% |
+| R2_w2 (backup stopped) | 371 /s | 371 /s | 0.0% |
+
+So with one variable changed - NUMA confinement - the same backup against the
+same service on the same fragmented node:
+
+- takes the service from **2,517,591 iops / p50 1.1us** to **224 iops /
+  p50 16ms / p99 59ms** (11,000x), with kswapd grinding the whole time;
+- and it does not recover when the backup stops (p50 8.0ms after 60s) - the
+  disk cannot refill the cache inside the workload's lifetime.
+
+Note the ordering: w1 (16ms) is *worse* than w2 (8ms), because while the
+backup runs the service loses its cache **and** competes for disk bandwidth;
+once the backup stops only the cold cache is left, and 8ms is exactly this
+disk's 4KB random-read latency.
+
+| | unbound | BOUND=1 |
+|---|---|---|
+| service, fragmented node, backup running | 2,234,475 iops / p50 1.4us | **224 iops / p50 16ms** |
+| kswapd in that window | 45 /s | **20,909 /s** |
+| service, after the backup stops | p50 1.4us | p50 8.0ms (no healing) |
+| control arm (no fragmentation) | p50 1.1us, kswapd 0 | p50 1.1us, kswapd 0 |
 
 ## Pump test
 
